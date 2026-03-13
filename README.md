@@ -1,239 +1,428 @@
 # Winch Protocol
 
-**Winch** is a pull-then-hold coordination protocol with deletion-as-ACK cascade. It
-defines how a blob moves from an originating endpoint to a terminating endpoint through
-a chain of storage-backed forwarding hops, and how confirmed delivery propagates back
-to the originator without a dedicated acknowledgment channel.
+Winch is a store-and-forward coordination protocol for two-party encrypted messaging
+over shared storage. A blob deposited by an originating endpoint accumulates at every
+hop in the pipeline during a forward pass; the terminating endpoint's read triggers a
+deletion cascade backward through the chain. The originating endpoint's send slot stays
+occupied until the full cascade completes, providing structural backpressure and implicit
+delivery confirmation with no additional state or mechanism.
 
-Winch is one of the coordination protocols in the [DropChannel system](../spec). It
-operates on channels whose names begin with the `winch-` prefix.
-
-The name reflects the physical mechanic: a winch pulls a load across a distance by
-winding in cable, one deliberate crank at a time. Each crank is a hop. The load is held
-at position between cranks. When the destination releases, the tension unwinds back
-through the cable — the ACK cascade.
-
----
-
-## The Core Idea
-
-Most messaging protocols are built on a **push** model: a sender actively transmits data
-toward a receiver, hop by hop, until it arrives. Winch is built on a **pull-then-hold**
-model: each participant independently notices that a blob is available upstream, pulls a
-copy without removing it, and deposits a copy at the next location. The blob accumulates
-at every hop simultaneously. No participant pushes anything toward the next — the payload
-*materializes* at each location rather than being thrown across.
-
-This distinction has deep consequences for crash recovery, delivery confirmation, and the
-nature of backpressure — all of which are addressed below.
+Winch is one protocol in the [DropChannel](https://github.com/dropchannel) runtime.
+The system-level specification — including the `ChannelProvider` interface, encryption
+standard, and protocol dispatch rules — lives in
+[`dropchannel/spec`](https://github.com/dropchannel/spec).
 
 ---
 
-## Concepts
+## Contents
 
-For definitions of Channel, Physical Pipeline, Slot, Endpoint, Node, and ChannelProvider,
-see the [DropChannel System Specification](../spec). Winch-specific concepts are defined
-here.
-
-### Recv Slot / Send Slot
-
-Each Node in a Winch pipeline operates on exactly two slots:
-
-- **Recv slot** — the slot it reads from (upstream)
-- **Send slot** — the slot it writes to (downstream)
-
-These are the only two slots a node knows about. The node has no visibility into the
-rest of the pipeline.
-
-### Forward Pass
-
-The phase during which a blob propagates from the originating endpoint toward the
-terminating endpoint. During the forward pass, no participant deletes its recv slot.
-The blob accumulates at every slot in the pipeline simultaneously.
-
-### ACK Cascade
-
-The phase during which confirmed delivery propagates back toward the originating endpoint.
-The cascade begins when the terminating endpoint's destructive `read()` clears the final
-slot. Each upstream node detects the clearing of its send slot and responds by deleting
-its own recv slot, triggering the next step in the cascade.
+- [Conceptual model](#conceptual-model)
+- [ChannelProvider interface](#channelprovider-interface)
+- [Propagation protocol](#propagation-protocol)
+- [Node lifecycle](#node-lifecycle)
+- [Heartbeat protocol](#heartbeat-protocol)
+- [Configuration](#configuration)
+- [Backward compatibility](#backward-compatibility)
+- [Version history](#version-history)
+- [Out of scope](#out-of-scope)
 
 ---
 
-## The Propagation Protocol
+## Conceptual model
 
-### Forward Pass
+### Channel
 
-The originating endpoint writes an encrypted blob to its send slot via `write()`. Each
-node polls its recv slot via `exists()`. On detecting a blob, the node reads it
-non-destructively via `peek()` and writes a copy to its send slot via `write()`. **No
-participant deletes its recv slot during the forward pass.**
-
-After full forward propagation, the pipeline looks like this (two-hop example):
+A **channel** is a bidirectional logical communication pipeline between exactly two
+endpoints. Bidirectionality is definitional — a channel always has two directions, each
+carried by an independent physical pipeline.
 
 ```
-  Endpoint A         Node 1            Node 2          Endpoint B
-  [send: ●] ──────▶ [recv: ●]  ─────▶ [recv: ●] ────▶ [recv: ●]
-                    [send: ●]          [send: ●]
+Endpoint A → [physical pipeline A→B] → Endpoint B
+Endpoint A ← [physical pipeline B→A] ← Endpoint B
 ```
 
-Every slot is occupied. All copies are byte-for-byte identical.
+### Physical pipeline
 
-### ACK Cascade
+A **physical pipeline** is a directed sequence of one or more `ChannelProvider` hops
+carrying opaque encrypted blobs from one endpoint to the other. A single-hop pipeline
+is two endpoints sharing a `ChannelProvider` directly. A multi-hop pipeline inserts one
+or more nodes between the endpoints.
 
-The terminating endpoint reads its recv slot via `read()`, which consumes and deletes it.
-This is the **only destructive read in the entire protocol**. The endpoint decrypts and
-processes the message.
+### Endpoint
 
-Each upstream node polls its send slot via `exists()`. On detecting that the slot has
-been cleared, the node calls `delete()` on its own recv slot. This clears the slot
-observed by the next upstream node, propagating the cascade.
+An **endpoint** is a process that originates or consumes messages. Endpoints are the
+only participants in a channel that perform encryption and decryption. An endpoint
+configures one physical pipeline per direction and interacts with storage exclusively
+through the `ChannelProvider` interface.
+
+Endpoints have no knowledge of how many hops their pipelines contain, what providers
+intermediate nodes use, or what the other endpoint looks like.
+
+### Node
+
+A **node** is a process that forwards blobs along a physical pipeline from one
+`ChannelProvider` to the next. Nodes do not encrypt, decrypt, or inspect message
+content — blobs are opaque bytes to a node. A node has exactly one inbound provider
+(recv-side) and one outbound provider (send-side), belongs to exactly one physical
+pipeline, and operates in one direction only.
+
+A node has no `SHARED_SECRET` and no knowledge of channel semantics.
+
+### Separation of concerns
+
+| Concern | Owner |
+|---------|-------|
+| Encryption / decryption | Endpoint only |
+| Message semantics | Client application layer |
+| Blob transport | ChannelProvider |
+| Multi-hop composition | Node configuration |
+| Delivery confirmation | Propagation protocol (ACK cascade) |
+| Backpressure | ACK cascade (send-slot occupied = in-flight) |
+| Pipeline observability | Heartbeat protocol |
+
+---
+
+## ChannelProvider interface
+
+Winch operates exclusively through the `ChannelProvider` interface. All storage
+operations — across all provider types and all hop positions — are expressed through
+these operations.
+
+### Primary slot operations
+
+| Operation | Behavior |
+|-----------|----------|
+| `write(channel_id, slot, data)` | Deposit blob. Returns `True` on success, `False` if slot occupied. |
+| `read(channel_id, slot)` | Retrieve and delete blob (consume-on-read). Returns blob or `None`. |
+| `peek(channel_id, slot)` | Retrieve blob without consuming it. Returns blob or `None`. |
+| `exists(channel_id, slot)` | Returns `True` if a blob is present, `False` if empty. |
+| `delete(channel_id, slot)` | Delete blob. Idempotent. |
+
+### Meta slot operations
+
+Used exclusively by the heartbeat protocol. Meta slots are a separate namespace within
+the same provider position and share no state with primary slots.
+
+| Operation | Behavior |
+|-----------|----------|
+| `meta_write(channel_id, slot, filename, data)` | Write or overwrite a named file in the meta namespace. |
+| `meta_read(channel_id, slot, filename)` | Read a named file. Returns `None` if not found. |
+| `meta_delete(channel_id, slot, filename)` | Delete a named file. Idempotent. |
+| `meta_list(channel_id, slot, prefix="")` | List filenames in the meta namespace, optionally filtered by prefix. |
+
+Full interface specification: [`spec/channel-provider.md`](https://github.com/dropchannel/spec/blob/main/channel-provider.md).
+
+---
+
+## Propagation protocol
+
+### Blob lifecycle invariant
+
+**Slot presence = pending. Slot absence = handled.**
+
+A blob in a slot means a message is in flight at that position. An empty slot means
+either nothing has been sent or the ACK cascade has completed. No separate queue, log,
+or delivery state is maintained.
+
+### Forward pass
+
+Each participant — originating endpoint and every intermediate node — reads its
+recv-slot using `peek()` (non-consuming) and writes the blob forward to its send-slot.
+No participant deletes its recv-slot during the forward pass. The blob accumulates at
+every hop simultaneously.
 
 ```
-  Endpoint A         Node 1            Node 2          Endpoint B
-  [send: ○] ◀────── [recv: ○]  ◀───── [recv: ○] ◀──── [recv: consumed by B]
-                    [send: ○]          [send: ○]
+After full forward propagation (two-hop example):
+
+  Endpoint A         Node              Endpoint B
+  [send: blob] →  [recv: blob]  →   [recv: blob]
+                  [send: blob]
 ```
 
-All slots empty. The originating endpoint, detecting its send slot cleared, knows
-delivery is confirmed and may send the next message.
+### ACK cascade
 
-### Key Properties
+1. **Terminating endpoint** calls `read()` on its recv-slot — the only consuming read
+   in the entire protocol. The blob is deleted and delivered to the application.
+
+2. **Final node** polls its send-slot with `exists()`. The deletion by the terminating
+   endpoint propagates as `exists()` → false. This is the ACK signal. The node calls
+   `delete()` on its own recv-slot.
+
+3. **Each preceding node** likewise polls its send-slot, detects the downstream
+   deletion, and calls `delete()` on its own recv-slot.
+
+4. **Originating endpoint** polls its send-slot. The first node's `delete()` cleared
+   it. `exists()` → false: delivery is confirmed. The endpoint is free to send the
+   next message.
+
+```
+After full ACK cascade (two-hop example):
+
+  Endpoint A         Node              Endpoint B
+  [send: empty] ← [recv: empty] ←  [recv: deleted by B]
+                  [send: empty]
+```
+
+### Key properties
 
 **Crash safety.** If any participant crashes mid-propagation, the blob remains durably
-stored at every slot already written. On restart, each participant reconstructs its exact
-state by inspecting its two slots. No external coordination or log is required.
+in every slot already written. On restart, each participant reconstructs its state by
+inspecting its two slots. No external coordination or log is required.
 
-**Delivery confirmation without a dedicated ACK channel.** The ACK cascade travels over
-the same pipeline as the data, using deletions rather than messages. No additional
-channel capacity is consumed by acknowledgment traffic.
+**Structural backpressure.** The originating endpoint's send-slot remains occupied for
+the entire round-trip. A second message cannot be sent until the ACK cascade completes.
+No additional throttling mechanism is needed.
 
-**Structural backpressure.** The originating endpoint's send slot remains occupied for
-the full round-trip duration. A second message cannot be sent until the ACK cascade
-completes. This is a protocol property, not a configuration option.
+**Delivery confirmation.** The originating endpoint receives implicit confirmation that
+the terminating endpoint consumed the message. The signal is the deletion of its
+send-slot, caused deterministically by the cascade.
 
-**Asynchronous node availability.** Because blobs are durably stored at each hop, nodes
-do not need to be online simultaneously. A node that is offline when a blob arrives will
-process it on restart. The pipeline stalls gracefully and resumes from exact state.
+**No in-memory buffering.** No participant holds a blob in memory between poll cycles.
+A node that has peeked but not yet written simply retries on the next poll.
 
----
+### Originating endpoint behavior
 
-## Node Lifecycle
+After depositing a blob via `write()`, the originating endpoint polls its send-slot
+with `exists()`. When `exists()` returns false, delivery is confirmed.
 
-A Winch node's complete behavior is determined by the observable state of its two slots.
+Polling the recv-slot for a response is an application concern, not a protocol concern.
+The return pipeline is always available independently.
 
-### Startup: Reconstruct State
+### Write guard
 
-On startup, a node peeks both slots once to determine its starting state:
-
-| Recv slot | Send slot | Action |
-|-----------|-----------|--------|
-| Empty | Empty | Enter recv-polling mode |
-| Occupied | Empty | peek recv → write send → enter send-polling mode |
-| Occupied | Occupied (payloads match) | Enter send-polling mode |
-| Occupied | Occupied (payloads differ) | **Error** — log SHA-256 of each, halt |
-| Empty | Occupied | **Impossible state** — log, halt |
-
-Payload comparison is byte-for-byte on raw (encrypted) bytes. No decryption is needed
-or performed. The SHA-256 hashes logged on mismatch allow post-hoc diagnosis without
-revealing plaintext.
-
-### Recv-Polling Mode
-
-Poll recv slot `exists()` only. Send slot is empty.
-
-On `exists()` → `true`: `peek()` recv, `write()` to send, transition to send-polling mode.
-
-### Send-Polling Mode
-
-Poll send slot `exists()` only. Recv slot is occupied and must not be touched.
-
-On `exists()` → `false`: `delete()` recv slot, transition to recv-polling mode.
-
-### Polling Cost
-
-Each steady-state mode requires exactly **one `exists()` call per poll cycle**. The only
-moments requiring additional operations are:
-
-- Forward transition: one `peek()` + one `write()`
-- ACK transition: one `delete()`
-
-This minimizes both operation count and cost against metered storage backends.
+`write()` returns `False` if the target slot is already occupied. The check-before-write
+sequence has an inherent race window on shared storage — atomicity is best-effort on all
+current providers.
 
 ---
 
-## Comparison with Other Protocols
+## Node lifecycle
 
-| Property | UDP | TCP | SMTP | Winch |
-|----------|-----|-----|------|-------|
-| Propagation model | Push (fire and forget) | Push (reliable stream) | Push (store and forward) | Pull-then-hold (materialization) |
-| Delivery guarantee | None | Yes (retransmit) | Best effort | Yes (ACK cascade) |
-| ACK mechanism | None | Receiver sends ACK packet | None (delivery reports optional) | Deletion propagates backward |
-| In-flight copies | One (in transit) | One (buffered) | One (per hop) | N (one per hop, all durable simultaneously) |
-| Crash recovery | None | Retransmit from buffer | Resume from spool | Restart and inspect two slots |
-| Backpressure | None | Sliding window | None | Structural (send slot occupied) |
-| Simultaneous availability | Required | Required | Not required | Not required |
-| Latency profile | Microseconds | Milliseconds | Seconds–hours | Seconds–minutes (poll-interval bound) |
-| Throughput | Many packets in flight | Sliding window | One message per queue slot | One message at a time per channel |
+### Startup: inspect both slots
 
-Winch is not a replacement for TCP, UDP, or SMTP. It operates at a different point in
-the design space: lower throughput, higher latency, but with asynchronous node
-availability, provider-agnostic hop composition, and structural delivery confirmation
-that other protocols require additional application-layer work to achieve.
+On startup the node calls `peek()` on both slots once to determine starting state.
 
-The closest historical analogues are SMTP/UUCP store-and-forward for the durable-hop
-property, and tuple spaces (Linda) for the materialization-at-every-location model.
-The combination of pull-then-hold propagation, deletion-as-ACK cascade,
-provider-agnostic hops, and structural backpressure is, as far as is known, novel as a
-unified protocol design.
+| Recv-slot | Send-slot | Condition | Action |
+|-----------|-----------|-----------|--------|
+| Empty | Empty | Idle | → Recv-polling mode |
+| Occupied | Empty | Unforwarded payload | `peek()` recv → `write()` send → Send-polling mode |
+| Occupied | Occupied (match) | Forwarded; awaiting ACK | → Send-polling mode |
+| Occupied | Occupied (differ) | State corruption | Log blob sizes and SHA-256 hashes, halt |
+| Empty | Occupied | Impossible state | Log, halt |
+
+Payload comparison is raw byte equality — no decryption needed.
+
+### Recv-polling mode (steady state: idle)
+
+```
+Loop:
+  exists(recv_slot)?
+    No  → sleep(poll_interval), repeat
+    Yes → blob = peek(recv_slot)
+          write(send_slot, blob)
+          → Send-polling mode
+```
+
+### Send-polling mode (steady state: in-flight)
+
+```
+Loop:
+  exists(send_slot)?
+    Yes → sleep(poll_interval), repeat
+    No  → delete(recv_slot)
+          → Recv-polling mode
+```
+
+### Polling cost
+
+| Phase | Operations per cycle |
+|-------|---------------------|
+| Startup | Two `peek()` calls, once only |
+| Recv-polling | One `exists()` |
+| Recv→Send transition | One `peek()` + one `write()` |
+| Send-polling | One `exists()` |
+| Send→Recv transition | One `delete()` |
 
 ---
 
-## What Winch Is Not
+## Heartbeat protocol
 
-**Winch is not a transport protocol.** It does not define how bytes move between
-machines. That is the responsibility of the ChannelProvider implementation.
+The heartbeat protocol runs on meta slots, independently of and without coupling to the
+primary payload channel.
 
-**Winch is not an encryption scheme.** The protocol assumes blobs are opaque and
-encrypted end-to-end by the endpoints. Nodes perform no cryptographic operations.
+### Participant identity
 
-**Winch is not a high-throughput protocol.** One message in flight per channel at a time
-is a hard structural property. Winch is the right choice when confirmed single-payload
-delivery matters more than throughput.
+Each node and endpoint has a persistent UUID (UUID4) generated on first startup and
+reloaded on all subsequent startups. Identity is expressed as `Node_<UUID>` for nodes
+and `Client_<UUID>` for endpoints.
 
-For use cases where the producer cannot stall on consumer availability — log shipping,
-telemetry, continuous data streams — see the
-[Ring protocol](../ring-protocol).
+### Heartbeat file naming
+
+```
+heartbeat-node-<UUID>      # written by a node
+heartbeat-client-<UUID>    # written by a client (endpoint)
+```
+
+### Heartbeat content
+
+**Node:**
+
+```
+<upstream_content>
+Node_<UUID>:<timestamp>:<alive_s>
+```
+
+**Client:**
+
+```
+Client_<UUID>:<timestamp>:<alive_s>:<status>:<status_s>
+```
+
+| Field | Description |
+|-------|-------------|
+| `timestamp` | Unix timestamp (seconds) at time of write |
+| `alive_s` | Seconds since this participant started its current session |
+| `status` | Client only: `ready`, `busy`, or `closing` |
+| `status_s` | Client only: seconds since current status was set |
+
+`upstream_content` is the full contents of the one non-self heartbeat file found on the
+relevant meta slot, or the literal string `HEARTBEAT_NOT_FOUND`.
+
+### Node heartbeat cycle
+
+Runs at `HEARTBEAT_INTERVAL` (default 30s), concurrently with the primary slot loop.
+
+**Step 1 — Read send-side meta, write recv-side meta:**
+Look for any non-self `heartbeat-node-*` or `heartbeat-client-*` file on the send-side
+meta slot. Read its contents (or use `HEARTBEAT_NOT_FOUND`). Append own line. Write to
+recv-side meta slot as `heartbeat-node-<UUID_self>`.
+
+**Step 2 — Read recv-side meta, write send-side meta:**
+Same operation in the other direction.
+
+**Step 3 — Sleep HI seconds. Repeat.**
+
+### Client heartbeat
+
+Clients write only their own `heartbeat-client-<UUID>` to both meta slots. They do not
+read or propagate any other heartbeat files.
+
+Writes are event-driven at status transitions and HI-driven in between.
+
+| Trigger | Status |
+|---------|--------|
+| Startup | `ready` |
+| Returning to idle | `ready` |
+| New message pickup | `busy` |
+| Shutdown | `closing` |
+
+`status_s` resets to 0 on every transition. `closing` is written once; no HI writes follow.
+
+### Startup purge
+
+Before beginning the heartbeat cycle, each participant deletes its own stale heartbeat
+files from both meta slots. Nodes purge `heartbeat-node-*`; clients purge
+`heartbeat-client-*`. Files written by other participants are left intact.
+
+### Reading heartbeat state
+
+In a healthy two-hop pipeline (`ClientA → Node → ClientB`), ClientA's recv-side meta
+slot contains a file written by the node with content such as:
+
+```
+Client_<B-UUID>:<timestamp>:<alive_s>:ready:<status_s>
+Node_<N-UUID>:<timestamp>:<alive_s>
+```
+
+`HEARTBEAT_NOT_FOUND` at any position identifies the stalled or offline hop.
+
+### Security
+
+Heartbeat content is unencrypted. It contains only UUIDs, timestamps, counters, and
+status strings — no payload content and no routing secrets. Encryption of heartbeat
+content via a dedicated key (`DRIP_KEY`) is deferred to a future revision.
 
 ---
 
-## Specification Versions
+## Configuration
+
+### Endpoint
+
+```bash
+CHANNEL_ID=<channel-name>
+SHARED_SECRET=<64 hex chars = 32 bytes>
+CHANNEL_PROVIDER=<gcs|httprelay|dropbox|local>
+SEND_SLOT=<slot this endpoint writes to>
+RECV_SLOT=<slot this endpoint reads from>
+HEARTBEAT_INTERVAL=30   # seconds, default 30
+```
+
+### Node
+
+```bash
+CHANNEL_ID=<channel-name>
+# No SHARED_SECRET — nodes never encrypt or decrypt
+RECV_PROVIDER=<gcs|httprelay|dropbox|local>
+SEND_PROVIDER=<gcs|httprelay|dropbox|local>
+RECV_SLOT=<slot name>   # same on both sides
+SEND_SLOT=<slot name>   # same slot name as RECV_SLOT
+HEARTBEAT_INTERVAL=30   # seconds, default 30
+```
+
+Provider-specific env vars are namespaced by direction when both sides use the same
+provider type:
+
+| Provider | Endpoint | Node recv-side | Node send-side |
+|----------|----------|----------------|----------------|
+| `httprelay` | `RELAY_URL` | `RECV_RELAY_URL` | `SEND_RELAY_URL` |
+| `gcs` | `GCS_BUCKET_NAME` | `RECV_GCS_BUCKET_NAME` | `SEND_GCS_BUCKET_NAME` |
+| `dropbox` | `DROPBOX_CHANNEL_PATH` | `RECV_DROPBOX_CHANNEL_PATH` | `SEND_DROPBOX_CHANNEL_PATH` |
+| `local` | `LOCAL_CHANNEL_PATH` | `RECV_LOCAL_CHANNEL_PATH` | `SEND_LOCAL_CHANNEL_PATH` |
+
+### Slot naming convention
+
+Slot names are agreed out-of-band between the two endpoint operators. The recommended
+convention names slots after direction of travel:
+
+```
+a-to-b    ← Endpoint A writes, Endpoint B reads
+b-to-a    ← Endpoint B writes, Endpoint A reads
+```
+
+The slot name is invariant across all hops in a physical pipeline.
+
+---
+
+## Backward compatibility
+
+A v0.5 or earlier participant in a v0.6+ pipeline will not write heartbeat files and
+will appear as `HEARTBEAT_NOT_FOUND` at its adjacent nodes. The pipeline continues to
+function; that hop is invisible to heartbeat diagnostics. In a mixed-version pipeline,
+`HEARTBEAT_NOT_FOUND` cannot distinguish an offline participant from a non-participating
+older one.
+
+---
+
+## Version history
 
 | Version | Summary |
 |---------|---------|
-| v0.1 | Initial: asymmetric ClientA/ClientB, GCS via Cloud Run, AES-256-GCM PSK |
-| v0.2 | Symmetric peers, generic slot names, write guard on occupied slot |
-| v0.3 | ChannelProvider abstraction, pluggable backends (GCS, Dropbox, local, httprelay) |
-| v0.4 | Channel as first-class concept, Node primitive, Winch propagation protocol, peek() |
-| v0.5 | Monorepo package structure, crypto isolation enforcement at package dependency level |
+| [v0.1](history/v0.1.md) | Initial protocol: asymmetric Sender/Receiver roles, two fixed slots (`request`/`response`), delete-on-read, AES-256-GCM encryption |
+| [v0.2](history/v0.2.md) | Symmetric peers, generic slot names, write guard |
+| [v0.3](history/v0.3.md) | `ChannelProvider` abstraction; storage medium becomes pluggable |
+| [v0.4](history/v0.4.md) | Channel and Node concepts formalised; propagation protocol and ACK cascade; `peek()` added to interface |
+| [v0.5](history/v0.5.md) | `http` provider renamed to `httprelay`; no protocol behavior changes |
+| [v0.6](history/v0.6.md) | Heartbeat protocol; meta slots; persistent participant identity |
 
 ---
 
-## Contributing
+## Out of scope
 
-This repository contains the Winch protocol specification only. Implementation
-contributions belong in the relevant implementation repository (e.g.,
-[dropchannel/dropchannel-py](../dropchannel-py)).
-
-When proposing changes to this specification, please distinguish between:
-
-- **Clarifications** — making the existing protocol more precisely described
-- **Extensions** — adding new capabilities while preserving backward compatibility
-- **Revisions** — changing existing behavior (requires a new spec version)
-
----
-
-## License
-
-Protocol specification: [Creative Commons CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/)
-(public domain dedication — implement freely without restriction)
+- `DRIP_KEY` encryption of heartbeat content
+- Automatic recovery from Occupied/Occupied payload-mismatch error state
+- Atomic write guards (compare-and-swap) for concurrent writers
+- Node fan-out (one inbound, multiple outbound)
+- Heartbeat-based alerting or notification (left to the client application layer)
+- Configurable `ABANDON_THRESHOLD` inference from heartbeat staleness
+- More than two parties per channel
+- Multiple messages in flight per slot
