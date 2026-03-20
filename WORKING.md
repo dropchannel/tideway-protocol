@@ -27,7 +27,6 @@ The canonical README covers:
 ## What does not exist yet
 
 - `history/v0.7.md` and beyond — no v0.7 spec has been written
-- Any content for the `ring-protocol` or `piston-protocol` repos
 
 ## How to start a new session here
 
