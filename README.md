@@ -1,13 +1,13 @@
-# Winch Protocol
+# Tide Protocol
 
-Winch is a store-and-forward coordination protocol for two-party encrypted messaging
+Tide is a store-and-forward coordination protocol for two-party encrypted messaging
 over shared storage. A blob deposited by an originating endpoint accumulates at every
 hop in the pipeline during a forward pass; the terminating endpoint's read triggers a
 deletion cascade backward through the chain. The originating endpoint's send slot stays
 occupied until the full cascade completes, providing structural backpressure and implicit
 delivery confirmation with no additional state or mechanism.
 
-Winch is one protocol in the [DropChannel](https://github.com/dropchannel) runtime.
+Tide is one protocol in the [DropChannel](https://github.com/dropchannel) runtime.
 The system-level specification — including the `ChannelProvider` interface, encryption
 standard, and protocol dispatch rules — lives in
 [`dropchannel/spec`](https://github.com/dropchannel/spec).
@@ -84,7 +84,7 @@ A node has no `SHARED_SECRET` and no knowledge of channel semantics.
 
 ## ChannelProvider interface
 
-Winch operates exclusively through the `ChannelProvider` interface. All storage
+Tide operates exclusively through the `ChannelProvider` interface. All storage
 operations — across all provider types and all hop positions — are expressed through
 these operations.
 

@@ -1,8 +1,8 @@
-# winch-protocol — Working Notes
+# tide-protocol — Working Notes
 
 ## What this repo is
 
-The specification for the Winch coordination protocol. Winch is one protocol in the
+The specification for the Tide coordination protocol. Tide is one protocol in the
 DropChannel runtime. System-level concerns (ChannelProvider interface, encryption,
 protocol dispatch) live in `dropchannel/spec`.
 
@@ -36,5 +36,5 @@ what you want to add or modify and why. The output will be a new `history/v0.x.m
 an updated `README.md`.
 
 Typical prompt:
-> "Read WORKING.md and README.md. I want to spec the following change to the Winch
+> "Read WORKING.md and README.md. I want to spec the following change to the Tide
 > protocol: [description]. Generate history/v0.x.md and an updated README.md."
