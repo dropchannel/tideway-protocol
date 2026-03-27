@@ -37,7 +37,7 @@ Channel connect the same two endpoints.
 A **Waterway** is a directed flow path within a Channel — a sequence of one or more
 Docks carrying payloads from one endpoint to the other. A single-hop Waterway is two
 endpoints sharing a Dock directly; a multi-hop Waterway inserts one or more Rafts
-between them.
+between two adjacent Docks.
 
 The Waterway name is invariant across all Docks in the hop sequence.
 
@@ -52,7 +52,7 @@ for the encryption standard.
 
 ### Raft
 
-A **Raft** is a forwarding participant. Rafts carry payloads between Docks without
+A **Raft** is a forwarding transport. Rafts carry payloads between Docks without
 decrypting or inspecting content — all payloads are opaque bytes to a Raft. A Raft
 operates against exactly two Docks: the `upper_dock` it reads from and the `lower_dock`
 it writes to. A Raft belongs to exactly one Waterway and has no knowledge of channel
@@ -80,9 +80,8 @@ payload accumulates at every hop simultaneously.
 ```
 After full forward pass (two-hop example):
 
-  Endpoint A         Raft              Endpoint B
-  [upper: blob] →  [upper: blob]  →   [upper: blob]
-                   [lower: blob]
+  Endpoint A ──► Dock A ──► Raft ──► Dock B ──► Endpoint B
+                 [blob]              [blob]
 ```
 
 ### ACK cascade
@@ -103,9 +102,8 @@ After full forward pass (two-hop example):
 ```
 After full ACK cascade (two-hop example):
 
-  Endpoint A         Raft              Endpoint B
-  [upper: empty] ← [upper: empty] ←  [upper: deleted by B]
-                   [lower: empty]
+  Endpoint A ◄── Dock A ◄── Raft ◄── Dock B ◄── Endpoint B
+                 [    ]              [    ]
 ```
 
 ### Key properties
