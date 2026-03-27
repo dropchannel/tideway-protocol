@@ -10,9 +10,12 @@ waterway system. No source code, build system, or tests. Markdown specs only.
 System-level concerns (DockProvider interface, encryption standard, security model,
 Agent/Worker runtime, observability) live in `dropchannel/spec` and are not owned here.
 
-**Naming note:** This repo is being renamed. The protocol was previously called
+**Naming note:** This repo was renamed in v0.7. The protocol was previously called
 *Winch* (prefix `winch-`), and is now called *Tideway* (prefix `tideway-`).
-History files (v0.1.md -v0.6.md) use old names — do not update them.
+History files (v0.1.md–v0.6.md) use old names — do not update them.
+
+**Links note:** Cross-repo links (to other repos in the DropChannel org) use
+<https://github.com/dropchannel/> as the URL root. Intra-repo links use relative URLs.
 
 ## Scope
 
@@ -60,6 +63,11 @@ contain: the version, what changed from the prior version, the design rationale,
 any compatibility notes. It must not restate unchanged mechanics. The full protocol
 definition at any point in time is `README.md`.
 
+**Keeping CLAUDE.md current:** When producing a new `history/v0.x.md`, review
+CLAUDE.md and update it to reflect any changes — in particular the current version
+in the "Working with this repo" section and any new or retired terms in the
+Vocabulary table.
+
 ## Vocabulary
 
 This repo uses DropChannel waterway terminology throughout. Do not use retired terms.
@@ -70,4 +78,4 @@ This repo uses DropChannel waterway terminology throughout. Do not use retired t
 | Dock / DockProvider | ChannelProvider |
 | Waterway | slot, reach |
 | upper_dock / lower_dock | recv_backend / send_backend |
-| Channel | channel_id (as namespace) |
+| channel | channel_id |
